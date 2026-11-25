@@ -1,0 +1,111 @@
+# Security scanning pipeline for a fork of OWASP Juice Shop.
+# Three scanners run in parallel; each uploads SARIF results to the repo's
+# Security tab (Security -> Code scanning) so findings can be triaged there.
+
+name: security-scan
+
+on:
+  push:              # every push to any branch
+  pull_request:      # every PR, so findings show up before merge
+  workflow_dispatch: # adds a "Run workflow" button in the Actions tab
+
+# Least privilege: read the code, write only to the Security tab.
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # ---------------------------------------------------------------
+  # SAST: Semgrep reads the source code and flags risky patterns
+  # (injection, XSS, insecure crypto, etc.).
+  # ---------------------------------------------------------------
+  semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        # p/owasp-top-ten and p/javascript are public rule packs.
+        # Semgrep exits 0 even when it finds issues (no --error flag),
+        # so the job reports findings without failing the build.
+        run: >
+          semgrep scan
+          --config p/owasp-top-ten
+          --config p/javascript
+          --config p/typescript
+          --sarif --output semgrep.sarif
+
+      - name: Upload to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------
+  # Secret scanning: gitleaks searches the full git history for
+  # committed passwords, API keys and tokens.
+  # ---------------------------------------------------------------
+  gitleaks:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, not just the latest commit
+
+      - name: Run gitleaks
+        # -u runs the container as the runner's user so it can read the
+        # repo and write the report. --exit-code 0 reports without failing.
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:latest detect \
+            --source /repo \
+            --report-format sarif \
+            --report-path /repo/gitleaks.sarif \
+            --exit-code 0
+
+      - name: Upload to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ---------------------------------------------------------------
+  # SCA: Trivy checks third-party dependencies against known CVEs.
+  # ---------------------------------------------------------------
+  trivy:
+    name: Dependencies (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Generate lockfile
+        # Trivy needs a lockfile to know exact dependency versions.
+        # --package-lock-only resolves versions without installing anything;
+        # --ignore-scripts keeps package install scripts from running.
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Run Trivy
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" \
+            -e TRIVY_CACHE_DIR=/tmp/trivy \
+            aquasec/trivy:latest fs \
+            --scanners vuln \
+            --format sarif \
+            --output /src/trivy.sarif \
+            /src
+
+      - name: Upload to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
